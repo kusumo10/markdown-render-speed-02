@@ -850,7 +850,17 @@ function parseInline(src, refs, noAuto) {
       const a = tryAutolink(src, i);
       if (a) { flush(); nodes.push({ t: 'link', href: a.href, text: a.text, auto: true }); i = a.end; continue; }
       const tag = scanTagAt(src, i);
-      if (tag) { flush(); nodes.push({ t: 'html', s: tag.text }); i = tag.end; continue; }
+      if (tag) {
+        // marked's tag() tokenizer: an opening "<a " sets inLink, a
+        // closing "</a>" clears it. Only when parsing a top-level inline
+        // run (not a link label: marked restores inLink after the label,
+        // so label-internal tags have no document-level effect).
+        if (!noAuto) {
+          if (!docInLink && /^<a /i.test(tag.text)) docInLink = true;
+          else if (docInLink && /^<\/a>/i.test(tag.text)) docInLink = false;
+        }
+        flush(); nodes.push({ t: 'html', s: tag.text }); i = tag.end; continue;
+      }
       buf += '&lt;'; i++; continue;
     }
     if (c === 38) { buf += '&'; i++; continue; }
@@ -895,15 +905,15 @@ function parseInline(src, refs, noAuto) {
       }
       buf += '\n'; i++; continue;
     }
-    if (c === 119 && !noAuto && src.slice(i, i + 4) === 'www.') {
+    if (c === 119 && !noAuto && !docInLink && src.slice(i, i + 4) === 'www.') {
       const w = tryWww(src, i);
       if (w) { flush(); nodes.push({ t: 'link', href: w.href, text: w.text, auto: true }); i = w.end; continue; }
     }
-    if (isAlpha(c) && !noAuto) {
+    if (isAlpha(c) && !noAuto && !docInLink) {
       const u = trySchemeUrl(src, i);
       if (u) { flush(); nodes.push({ t: 'link', href: u.href, text: u.text, auto: true }); i = u.end; continue; }
     }
-    if (c === 64 && !noAuto) {
+    if (c === 64 && !noAuto && !docInLink) {
       const e = tryEmail(src, i, inUnderscoreEm(i));
       if (e) {
         const localLen = i - e.start;
@@ -1336,6 +1346,13 @@ function isThematicBreak(s) {
 }
 
 let globalRefs = new Map();
+// Document-level "inside <a>...</a>" flag, mirroring marked's
+// Lexer.state.inLink: an opening "<a " tag parsed as inline HTML sets it,
+// a closing "</a>" clears it, and it is NOT reset between blocks. While
+// set, bare autolinks (www., scheme URLs, emails) are not linkified
+// (marked gates only its `url` tokenizer on inLink, not `<...>` autolinks).
+// Reset per parse() call (stateless per case).
+let docInLink = false;
 
 export function parse(markdown) {
   const src = markdown.replace(/\r\n?/g, '\n');
@@ -1344,6 +1361,7 @@ export function parse(markdown) {
 
   const refs = new Map();
   globalRefs = refs;
+  docInLink = false;
   const root = { t: 'root', children: [] };
   let open = [root];
 
