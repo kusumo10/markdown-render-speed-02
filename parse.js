@@ -267,6 +267,7 @@ function scanTagAt(src, pos) {
     if (!isAlpha(src.charCodeAt(i)) && src.charCodeAt(i) !== 95 && src.charCodeAt(i) !== 58) return null;
     i++;
     while (i < n && (isAlnum(src.charCodeAt(i)) || src.charCodeAt(i) === 95 || src.charCodeAt(i) === 58 || src.charCodeAt(i) === 46 || src.charCodeAt(i) === 45)) i++;
+    const nameEnd = i;
     while (i < n && (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9 || src.charCodeAt(i) === 10)) i++;
     if (i < n && src.charCodeAt(i) === 61) {
       i++;
@@ -285,7 +286,9 @@ function scanTagAt(src, pos) {
       }
       lastNonWS = i - 1;
     } else {
-      lastNonWS = i - 1;
+      // Valueless attribute: the last non-whitespace char is the end
+      // of the name (before the whitespace skipped above), not i - 1.
+      lastNonWS = nameEnd - 1;
       if (an === i) return null;
     }
   }
@@ -1273,6 +1276,24 @@ export function parse(markdown) {
     if (cur.partial > 0) s = ' '.repeat(cur.partial) + s.slice(1);
     return s;
   };
+  // Paragraph content: leading tabs are expanded to spaces to the next
+  // tab stop (from cur.col) when inside a container (blockquote/list
+  // item); at the top level leading tabs are kept literally. A
+  // partially-consumed tab (partial > 0) is already handled by
+  // curExpandedText.
+  const paraText = () => {
+    const s = curExpandedText();
+    if (cur.partial !== 0 || !open.some(b => b.t === 'quote' || b.t === 'item' || b.t === 'list')) return s;
+    let k = 0;
+    while (k < s.length && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9)) k++;
+    if (k === 0 || !s.slice(0, k).includes('\t')) return s;
+    let col = cur.col, out = '';
+    for (let j = 0; j < k; j++) {
+      if (s.charCodeAt(j) === 32) { out += ' '; col++; }
+      else { const w = 4 - (col % 4); out += ' '.repeat(w); col += w; }
+    }
+    return out + s.slice(k);
+  };
   const measureLeadingWhitespace = () => {
     let col = cur.col, off = cur.off, n = 0;
     while (off < cur.line.length) {
@@ -1301,6 +1322,13 @@ export function parse(markdown) {
   }
   function tryListMarker() {
     const save = curSave();
+    // The container content start (before the marker's own up-to-3
+    // space indent) is the base for the item's RELATIVE content
+    // indent: a continuation line must reach base + relIndent, where
+    // the base is re-established per line by container matching. This
+    // makes nested-quote items work (cm-259/260), where the ">" markers
+    // sit at different absolute columns on different lines.
+    const baseCol = cur.col;
     curSkipSpaces(3);
     const markerCol = cur.col;
     const c = curChar();
@@ -1326,6 +1354,7 @@ export function parse(markdown) {
       }
     }
     if (li) {
+      li.relIndent = li.contentIndent - baseCol;
       // Whether the marker is followed by any non-whitespace content.
       // An empty item (marker alone) cannot interrupt a paragraph.
       let p = cur.off + li.markerLen;
@@ -1481,7 +1510,7 @@ export function parse(markdown) {
       // A line with only whitespace left (e.g. a list marker followed
       // by spaces) starts no paragraph; the trailing spaces are not
       // content and must not become a hard break.
-      const restText = curExpandedText();
+      const restText = paraText();
       if (restText.trim() === '') return true;
       const p = makePara();
       p.lines.push(restText);
@@ -1506,7 +1535,7 @@ export function parse(markdown) {
       const prev = list.children[list.children.length - 1];
       if (prev.blankPending) list.tight = false;
     }
-    const item = { t: 'item', contentIndent: li.contentIndent, children: [], blankPending: false, task: null, _list: list };
+    const item = { t: 'item', contentIndent: li.contentIndent, relIndent: li.relIndent, children: [], blankPending: false, task: null, _list: list };
     list.children.push(item);
     open.push(item);
     curAdvanceTo(li.contentIndent);
@@ -1758,11 +1787,41 @@ export function parse(markdown) {
         // columns loses exactly 4 columns of indent. A normal top-level
         // paragraph continuation keeps its leading spaces.
         const paraParentIdx = open.length - 2;
-        if (matched < paraParentIdx) {
-          const lead = measureLeadingWhitespace();
-          if (lead >= 4) curAdvance(4);
+        // A lazy setext-underline candidate ("=" run) inside a
+        // blockquote is NOT a heading (it is lazy), but marked renders
+        // it with exactly 4 leading spaces, whatever its own indent
+        // was (0-4 spaces all become 4). A leading tab is kept as-is
+        // (no strip, no 4 spaces). This applies only inside a
+        // blockquote, not in a list.
+        let text = null;
+        if (matched < paraParentIdx && open.some(b => b.t === 'quote')) {
+          const raw = cur.line.slice(cur.off);
+          if (raw.length > 0) {
+            if (raw.charCodeAt(0) === 9) {
+              let eq = 1;
+              while (eq < raw.length && raw.charCodeAt(eq) === 61) eq++;
+              let tr = eq;
+              while (tr < raw.length && (raw.charCodeAt(tr) === 32 || raw.charCodeAt(tr) === 9)) tr++;
+              if (eq > 1 && tr === raw.length) text = raw;
+            } else {
+              let sp = 0;
+              while (sp < raw.length && raw.charCodeAt(sp) === 32) sp++;
+              let eq = sp;
+              while (eq < raw.length && raw.charCodeAt(eq) === 61) eq++;
+              let tr = eq;
+              while (tr < raw.length && (raw.charCodeAt(tr) === 32 || raw.charCodeAt(tr) === 9)) tr++;
+              if (eq > sp && tr === raw.length) text = '    ' + raw.slice(sp);
+            }
+          }
         }
-        tip0.lines.push(curExpandedText());
+        if (text === null) {
+          if (matched < paraParentIdx) {
+            const lead = measureLeadingWhitespace();
+            if (lead >= 4) curAdvance(4);
+          }
+          text = paraText();
+        }
+        tip0.lines.push(text);
         return;
       }
     }
@@ -1794,7 +1853,7 @@ export function parse(markdown) {
         startBlocks();
         return;
       }
-      top.lines.push(curExpandedText());
+      top.lines.push(paraText());
       return;
     }
     if (top.t === 'table') {
