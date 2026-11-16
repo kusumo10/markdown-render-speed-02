@@ -648,6 +648,10 @@ function isBlankLine(s) {
 // such a region do not form emphasis, even when the link itself does
 // not form (its label is invalid on the unmasked text).
 function maskedLinkRanges(src) {
+  // Fast path: masking only matters for "[label](dest)" ranges. With
+  // no "[" there is nothing to mask (avoids split/join + scans on
+  // every inline run).
+  if (src.indexOf('[') === -1) return [];
   const n = src.length;
   // Step 1: mask backticks inside code spans with '+'.
   const m = src.split('');
