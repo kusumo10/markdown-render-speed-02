@@ -80,6 +80,14 @@ function escapeAttr(s) {
 
 const NAMED_ENTITY_RE = /^&[A-Za-z][A-Za-z0-9]*;/;
 function decodeNumericRefs(s) {
+  // Fast path: no "&", "<", ">", '"', "'", or U+E000 placeholder --
+  // the overwhelmingly common case for plain text. Return as-is.
+  let hasSpecial = false;
+  for (let k = 0; k < s.length; k++) {
+    const c = s.charCodeAt(k);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 0xe000) { hasSpecial = true; break; }
+  }
+  if (!hasSpecial) return s;
   let out = '', i = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i);
@@ -102,9 +110,13 @@ function decodeNumericRefs(s) {
       out += '&amp;'; i++; continue;
     }
     if (c === 38) {
-      const rest = s.slice(i);
-      const m = NAMED_ENTITY_RE.exec(rest);
-      if (m) { out += m[0]; i += m[0].length; continue; }
+      // Manual named-entity scan (avoids slice + regex per "&").
+      let j = i + 1;
+      if (j < s.length && isAlpha(s.charCodeAt(j))) {
+        j++;
+        while (j < s.length && isAlnum(s.charCodeAt(j))) j++;
+        if (j < s.length && s.charCodeAt(j) === 59) { out += s.slice(i, j + 1); i = j + 1; continue; }
+      }
       out += '&amp;'; i++; continue;
     }
     if (c === 60) out += '&lt;';
@@ -120,13 +132,48 @@ function escapeText(s) { return decodeNumericRefs(s); }
 
 function encodeHref(dest) {
   let enc = encodeURI(dest);
+  // Fast path: no "[", "]", "%", "&", "<", ">", '"', "'" -- return the
+  // encodeURI result directly (the common case for plain URLs).
+  let special = false;
+  for (let k = 0; k < enc.length; k++) {
+    const c = enc.charCodeAt(k);
+    if (c === 91 || c === 93 || c === 37 || c === 38 || c === 60 || c === 62 || c === 34 || c === 39) { special = true; break; }
+  }
+  if (!special) return enc;
   enc = enc.replace(/\[/g, '%5B').replace(/\]/g, '%5D').replace(/%25/g, '%');
+  // After the bracket fixes, only "&" and "<>\"'" need escaping.
+  let special2 = false;
+  for (let k = 0; k < enc.length; k++) {
+    const c = enc.charCodeAt(k);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) { special2 = true; break; }
+  }
+  if (!special2) return enc;
   let out = '', i = 0;
   while (i < enc.length) {
     const c = enc.charCodeAt(i);
     if (c === 38) {
-      const rest = enc.slice(i);
-      if (/^&#[xX][0-9A-Fa-f]{1,6};/.test(rest) || /^&#[0-9]{1,7};/.test(rest) || NAMED_ENTITY_RE.test(rest)) { out += '&'; i++; continue; }
+      // Manual entity check (no slice + regex): "&" + optional "#"
+      // + optional x/X + 1-7 digits/1-6 hex + ";", or "&" + letter +
+      // alnum* + ";".
+      let j = i + 1, ok = false;
+      if (j < enc.length && enc.charCodeAt(j) === 35) {
+        j++;
+        if (j < enc.length && (enc.charCodeAt(j) === 120 || enc.charCodeAt(j) === 88)) j++;
+        const ds = j;
+        let hex = false;
+        if (ds > i + 2) hex = true;
+        while (j < enc.length) {
+          const d = enc.charCodeAt(j);
+          if (hex ? ((d >= 48 && d <= 57) || (d >= 65 && d <= 70) || (d >= 97 && d <= 102)) : (d >= 48 && d <= 57)) { j++; continue; }
+          break;
+        }
+        if (j < enc.length && enc.charCodeAt(j) === 59 && j - ds >= 1 && j - ds <= (hex ? 6 : 7)) ok = true;
+      } else if (j < enc.length && isAlpha(enc.charCodeAt(j))) {
+        j++;
+        while (j < enc.length && isAlnum(enc.charCodeAt(j))) j++;
+        if (j < enc.length && enc.charCodeAt(j) === 59) ok = true;
+      }
+      if (ok) { out += '&'; i++; continue; }
       out += '&amp;'; i++; continue;
     }
     if (c === 60) out += '&lt;';
@@ -480,19 +527,41 @@ function tryWww(src, i) {
 }
 const SCHEMES = ['http://', 'https://', 'ftp://', 'sftp://'];
 function trySchemeUrl(src, i) {
-  for (const s of SCHEMES) {
-    if (src.slice(i, i + s.length).toLowerCase() === s) {
+  // Case-insensitive scheme match without slicing: compare the first
+  // letter, then the rest char by char (lowercased on the fly).
+  const c0 = src.charCodeAt(i) | 32;
+  if (c0 === 104 || c0 === 102 || c0 === 115) {
+    for (const s of SCHEMES) {
+      if ((src.charCodeAt(i) | 32) !== s.charCodeAt(0)) continue;
+      let ok = true;
+      for (let k = 1; k < s.length; k++) {
+        if ((src.charCodeAt(i + k) | 32) !== s.charCodeAt(k)) { ok = false; break; }
+      }
+      if (!ok) continue;
       const end = schemeUrlEnd(src, i);
       if (end - i <= s.length) return null;
       return { href: src.slice(i, end), text: src.slice(i, end), end };
     }
   }
-  // A scheme followed by an email (+ one path segment) is autolinked:
-  // "mailto:foo@bar.baz", "xmpp:foo@bar.baz/txt". A scheme followed by
-  // "//" is only linked for http/https/ftp/sftp (handled above).
-  const m = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(src.slice(i));
-  if (m) {
-    const afterColon = i + m[0].length;
+  // A scheme followed by an email (+ one path segment) is autolinked,
+  // but ONLY for "mailto:" and "xmpp:" (probed: tel/foo/abc/irc/sip/
+  // skype/callto/bitcoin/magnet do NOT link as a whole). The scheme
+  // must be all-lowercase: "MAILTO:foo@bar.com" does NOT link as a
+  // whole (only "foo@bar.com" becomes an email link). A scheme followed
+  // by "//" is only linked for http/https/ftp/sftp (handled above).
+  // Manual scheme scan (no slice): letter, then alnum/+/-/. (2-32),
+  // then ":".
+  let k = i + 1;
+  let lower = src.charCodeAt(i) >= 97 && src.charCodeAt(i) <= 122;
+  while (k < src.length) {
+    const d = src.charCodeAt(k);
+    if (d >= 65 && d <= 90) lower = false;
+    if (isAlnum(d) || d === 43 || d === 45 || d === 46) { k++; continue; }
+    break;
+  }
+  const schemeText = src.slice(i, k);
+  if (lower && (schemeText === 'mailto' || schemeText === 'xmpp') && k < src.length && src.charCodeAt(k) === 58) {
+    const afterColon = k + 1;
     if (!src.startsWith('//', afterColon)) {
       const e = tryEmailAt(src, afterColon, afterColon);
       if (e) {
@@ -1018,30 +1087,35 @@ function processEmphasis(nodes) {
   }
 }
 
-function renderInline(nodes) {
-  let out = '';
+function renderInlineInto(nodes, out) {
   for (const nd of nodes) {
-    if (nd.t === 'text') out += escapeText(nd.s);
-    else if (nd.t === 'code') out += '<code>' + escapeCode(nd.s) + '</code>';
-    else if (nd.t === 'br') out += '<br>';
-    else if (nd.t === 'html') out += nd.s;
-    else if (nd.t === 'em') out += '<em>' + renderInline(nd.children) + '</em>';
-    else if (nd.t === 'strong') out += '<strong>' + renderInline(nd.children) + '</strong>';
-    else if (nd.t === 'del') out += '<del>' + renderInline(nd.children) + '</del>';
+    if (nd.t === 'text') out.push(escapeText(nd.s));
+    else if (nd.t === 'code') { out.push('<code>', escapeCode(nd.s), '</code>'); }
+    else if (nd.t === 'br') out.push('<br>');
+    else if (nd.t === 'html') out.push(nd.s);
+    else if (nd.t === 'em') { out.push('<em>'); renderInlineInto(nd.children, out); out.push('</em>'); }
+    else if (nd.t === 'strong') { out.push('<strong>'); renderInlineInto(nd.children, out); out.push('</strong>'); }
+    else if (nd.t === 'del') { out.push('<del>'); renderInlineInto(nd.children, out); out.push('</del>'); }
     else if (nd.t === 'link') {
-      if (nd.auto) out += '<a href="' + escapeAttr(encodeHref(nd.href)) + '">' + escapeText(nd.text) + '</a>';
+      if (nd.auto) { out.push('<a href="', escapeAttr(encodeHref(nd.href)), '">', escapeText(nd.text), '</a>'); }
       else {
-        out += '<a href="' + escapeAttr(encodeHref(nd.href)) + '"';
-        if (nd.title != null) out += ' title="' + escapeAttr(nd.title) + '"';
-        out += '>' + renderInline(nd.children) + '</a>';
+        out.push('<a href="', escapeAttr(encodeHref(nd.href)), '"');
+        if (nd.title != null) out.push(' title="', escapeAttr(nd.title), '"');
+        out.push('>');
+        renderInlineInto(nd.children, out);
+        out.push('</a>');
       }
     } else if (nd.t === 'image') {
-      out += '<img src="' + escapeAttr(encodeHref(nd.src)) + '" alt="' + escapeAttr(nd.alt || '') + '"';
-      if (nd.title != null) out += ' title="' + escapeAttr(nd.title) + '"';
-      out += '>';
+      out.push('<img src="', escapeAttr(encodeHref(nd.src)), '" alt="', escapeAttr(nd.alt || ''), '"');
+      if (nd.title != null) out.push(' title="', escapeAttr(nd.title), '"');
+      out.push('>');
     }
   }
-  return out;
+}
+function renderInline(nodes) {
+  const out = [];
+  renderInlineInto(nodes, out);
+  return out.join('');
 }
 
 // ------------------------------------------------------------- block parsing
@@ -1281,6 +1355,12 @@ export function parse(markdown) {
   function finalizePara(b) {
     let idx = 0;
     while (idx < b.lines.length) {
+      // Fast pre-check: a definition's first line must start (after at
+      // most 3 spaces) with "[". Skip the expensive join/scan otherwise.
+      const first = b.lines[idx];
+      let sp = 0;
+      while (sp < first.length && sp < 4 && (first.charCodeAt(sp) === 32 || first.charCodeAt(sp) === 9)) sp++;
+      if (sp > 3 || sp >= first.length || first.charCodeAt(sp) !== 91) break;
       const d = tryParseDef(b.lines.slice(idx));
       if (!d) break;
       if (!refs.has(d.label)) refs.set(d.label, { dest: d.dest, title: d.title });
