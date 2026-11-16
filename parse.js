@@ -481,39 +481,21 @@ function schemeUrlEnd(src, i) {
     const semi = src.indexOf(';', amp);
     if (semi !== -1 && semi < end && /^&\w+;$/.test(src.slice(amp, semi + 1))) end = amp;
   }
-  while (end > i) {
-    const c = src.charCodeAt(end - 1);
-    if (c === 46 || c === 44 || c === 59 || c === 58 || c === 33 || c === 63 || c === 34 || c === 39 || c === 95 || c === 126 || c === 42) end--;
-    else break;
-  }
-  let bal = 0;
-  for (let k = i; k < end; k++) {
-    const c = src.charCodeAt(k);
-    if (c === 40) bal++;
-    if (c === 41) bal--;
-  }
-  while (bal < 0 && end > i) {
-    if (src.charCodeAt(end - 1) === 41) { end--; bal++; } else break;
-  }
-  let parenDepth = 0;
-  for (let k = i; k < end; k++) {
-    const c = src.charCodeAt(k);
-    if (c === 40) {
-      // An unbalanced "(" truncates the URL just before it, whether or
-      // not earlier ")"s drove the depth negative.
-      if (k > i) {
-        let bal2 = 0;
-        for (let m = k; m < end; m++) {
-          if (src.charCodeAt(m) === 40) bal2++;
-          if (src.charCodeAt(m) === 41) bal2--;
-        }
-        if (bal2 > 0) { end = k; break; }
-      }
-      parenDepth++;
-    }
-    if (c === 41 && parenDepth > 0) parenDepth--;
-  }
-  return end;
+  // GFM autolink backpedal, matching marked's _backpedal regex:
+  // repeatedly keep the longest prefix that is a run of non-punct
+  // chars, a balanced "(...)" group, a non-entity "&", or trailing
+  // punct that is not at the very end, until stable. This keeps a
+  // trailing "]" (not in the punct set) and a ")" before it, and
+  // keeps a "(...)" group even when an unmatched ")" precedes it.
+  const backpedalRe = /^(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+  let url = src.slice(i, end);
+  let prev;
+  do {
+    prev = url;
+    const m = backpedalRe.exec(url);
+    url = m ? m[0] : '';
+  } while (url !== prev);
+  return i + url.length;
 }
 function tryWww(src, i) {
   const prev = i === 0 ? -1 : src.charCodeAt(i - 1);
@@ -525,7 +507,10 @@ function tryWww(src, i) {
   if (end - i < 5) return null;
   const text = src.slice(i, end);
   if (!/^(www\.)[^ \t\n]*[A-Za-z0-9_~\-]$/.test(text) && !/^www\.[A-Za-z0-9-]+/.test(text)) return null;
-  if (text === 'www.' || /[^A-Za-z0-9._~:/?#@!$&'()*+,;=%-]/.test(text)) return null;
+  // A backslash is a valid URL character here (marked's www pattern
+  // allows any non-space, non-"<" character); it is percent-encoded
+  // in the href.
+  if (text === 'www.' || /[^A-Za-z0-9._~:/?#@!$&'()*+,;=%\\-]/.test(text)) return null;
   return { href: 'http://' + text, text, end };
 }
 const SCHEMES = ['http://', 'https://', 'ftp://', 'sftp://'];
@@ -584,7 +569,7 @@ function trySchemeUrl(src, i) {
   }
   return null;
 }
-function tryEmailAt(src, localStart, matchStart) {
+function tryEmailAt(src, localStart, matchStart, inEm) {
   let j = localStart;
   const n = src.length;
   let at = -1;
@@ -602,8 +587,14 @@ function tryEmailAt(src, localStart, matchStart) {
     break;
   }
   let end = k;
-  // A trailing "-" or "_" after the domain makes the WHOLE thing not an
-  // email (unlike ".", which is trimmed and the email still forms).
+  // A trailing "_" after the domain is an emphasis delimiter, not
+  // part of the domain, when the email sits inside an unclosed "_"
+  // span; otherwise a trailing "-" or "_" kills the email (the domain
+  // must end in an alphanumeric).
+  let trimmedUnderscore = false;
+  if (inEm) {
+    while (end > j && src.charCodeAt(end - 1) === 95) { end--; trimmedUnderscore = true; }
+  }
   if (end > j) {
     const lastDom = src.charCodeAt(end - 1);
     if (lastDom === 45 || lastDom === 95) return null;
@@ -616,11 +607,18 @@ function tryEmailAt(src, localStart, matchStart) {
   const dom = src.slice(j, end);
   if (!dom || dom.charCodeAt(0) === 46 || !dom.includes('.')) return null;
   if (/[._-]/.test(dom.charAt(dom.length - 1))) return null;
-  const local = src.slice(localStart, at);
+  // When the email is wrapped in "_" emphasis, the leading "_"s of
+  // the local part are the opening delimiter, not part of the email.
+  let start = localStart;
+  if (inEm && trimmedUnderscore) {
+    while (start < at && src.charCodeAt(start) === 95) start++;
+    if (start === at) return null;
+  }
+  const local = src.slice(start, at);
   if (!local) return null;
-  return { start: matchStart, end, text: src.slice(matchStart, end) };
+  return { start, end, text: src.slice(start, end) };
 }
-function tryEmail(src, i) {
+function tryEmail(src, i, inEm) {
   // i is the '@'. Find the local part start.
   let s = i - 1;
   while (s >= 0) {
@@ -632,7 +630,7 @@ function tryEmail(src, i) {
   if (s === i) return null;
   // A backslash-escaped first character is not part of an email.
   if (s > 0 && src.charCodeAt(s - 1) === 92 && isPunct(src.charCodeAt(s))) return null;
-  return tryEmailAt(src, s, s);
+  return tryEmailAt(src, s, s, inEm);
 }
 function isBlankLine(s) {
   for (let i = 0; i < s.length; i++) {
@@ -642,13 +640,148 @@ function isBlankLine(s) {
   return true;
 }
 
+// Ranges of "[...](...)" constructs that marked masks out before
+// emphasis matching (its emStrong "blockSkip"): the label is scanned
+// on text where backticks inside code spans were first replaced by
+// "+" (its "anyPunctuationOutsideCode"), so a label whose code span
+// contains a backtick becomes valid there. Emphasis delimiters inside
+// such a region do not form emphasis, even when the link itself does
+// not form (its label is invalid on the unmasked text).
+function maskedLinkRanges(src) {
+  const n = src.length;
+  // Step 1: mask backticks inside code spans with '+'.
+  const m = src.split('');
+  let i = 0;
+  while (i < n) {
+    if (src.charCodeAt(i) !== 96) { i++; continue; }
+    let j = i;
+    while (j < n && src.charCodeAt(j) === 96) j++;
+    const run = j - i;
+    let k = j, found = -1;
+    while (k < n) {
+      if (src.charCodeAt(k) === 96) {
+        let q = k;
+        while (q < n && src.charCodeAt(q) === 96) q++;
+        if (q - k === run) { found = k; break; }
+        k = q;
+      } else k++;
+    }
+    if (found === -1) { i = j; continue; }
+    for (let p = j; p < found; p++) {
+      if (src.charCodeAt(p) === 96) m[p] = '+';
+    }
+    i = found + run;
+  }
+  const masked = m.join('');
+  // Step 2: scan the masked text for "[label](dest)".
+  const ranges = [];
+  i = 0;
+  while (i < n) {
+    if (masked.charCodeAt(i) !== 91) { i++; continue; }
+    const start = i;
+    let j = i + 1;
+    let closed = -1;
+    while (j < n) {
+      const c = masked.charCodeAt(j);
+      if (c === 91) break;
+      if (c === 93) { closed = j; break; }
+      if (c === 92 && j + 1 < n) { j += 2; continue; }
+      if (c === 96) {
+        let k = j;
+        while (k < n && masked.charCodeAt(k) === 96) k++;
+        const run = k - j;
+        // The closing run is the FIRST backtick run after the
+        // content; the content cannot contain backticks.
+        let p = k;
+        while (p < n && masked.charCodeAt(p) !== 96) p++;
+        if (p >= n) break;
+        let q = p;
+        while (q < n && masked.charCodeAt(q) === 96) q++;
+        if (q - p !== run) break;
+        j = q;
+        continue;
+      }
+      j++;
+    }
+    if (closed === -1) { i++; continue; }
+    if (closed + 1 >= n || masked.charCodeAt(closed + 1) !== 40) { i++; continue; }
+    let d = closed + 2;
+    let depth = 1;
+    let destEnd = -1;
+    while (d < n) {
+      const c = masked.charCodeAt(d);
+      if (c === 92 && d + 1 < n) { d += 2; continue; }
+      if (c === 40) depth++;
+      else if (c === 41) {
+        depth--;
+        if (depth === 0) { destEnd = d + 1; break; }
+      }
+      d++;
+    }
+    if (destEnd === -1) { i++; continue; }
+    ranges.push([start, destEnd]);
+    i = destEnd;
+  }
+  return ranges;
+}
+
 // ------------------------------------------------------------ inline parsing
-function parseInline(src, refs) {
+// noAuto: when true, bare autolinks (www., scheme URLs, emails) are not
+// formed. Used for link/image labels: inside a link, a bare URL stays
+// plain text (only a markdown-style link inside a label blocks it).
+function parseInline(src, refs, noAuto) {
   const nodes = [];
   const n = src.length;
   let i = 0;
   let buf = '';
+  const maskRanges = maskedLinkRanges(src);
+  const inMaskedRange = (pos) => {
+    for (let r = 0; r < maskRanges.length; r++) {
+      if (pos >= maskRanges[r][0] && pos < maskRanges[r][1]) return true;
+    }
+    return false;
+  };
   const flush = () => { if (buf) { nodes.push({ t: 'text', s: buf }); buf = ''; } };
+  // Whether position i lies inside an unclosed "_" emphasis span.
+  // Emphasis delimiters are matched greedily right-to-left: a pure
+  // closer (an "_" run with a left-flanking closer that cannot open)
+  // is paired with the next opener to its left, so only an unmatched
+  // opener leaves us inside emphasis. (Left-flanking here uses the
+  // same "no surrounding whitespace" approximation as the delimiter
+  // scan in the renderer.)
+  const inUnderscoreEm = (pos) => {
+    let open = 0;
+    let j = 0;
+    while (j < pos) {
+      if (src.charCodeAt(j) !== 95) { j++; continue; }
+      const start = j;
+      while (j < pos && src.charCodeAt(j) === 95) j++;
+      const len = j - start;
+      const before = start > 0 ? src.charCodeAt(start - 1) : 32;
+      const after = j < src.length ? src.charCodeAt(j) : 32;
+      const afterPunct = isPunct(after);
+      const beforePunct = isPunct(before);
+      const afterWS = after === 32 || after === 9 || after === 10;
+      const beforeWS = before === 32 || before === 9 || before === 10;
+      const leftFlanking = !afterWS && (!afterPunct || beforeWS || beforePunct);
+      const rightFlanking = !beforeWS && (!beforePunct || afterWS || afterPunct);
+      // CommonMark "_" rules: it can open only when left-flanking
+      // and (not right-flanking or preceded by punctuation), and can
+      // close only when right-flanking and (not left-flanking or
+      // followed by punctuation). An intraword "_" can do neither.
+      const canOpen = leftFlanking && (!rightFlanking || beforePunct);
+      const canClose = rightFlanking && (!leftFlanking || afterPunct);
+      if (canClose && !canOpen) {
+        // Pure closer: pair with the nearest unmatched opener.
+        if (open > 0) open--;
+      } else if (canOpen) {
+        // Opener (or ambiguous opener/closer): it opens a span if
+        // nothing else consumes it.
+        open++;
+      }
+    }
+    return open > 0;
+  };
   while (i < n) {
     const c = src.charCodeAt(i);
     if (c === 92) {
@@ -687,6 +820,15 @@ function parseInline(src, refs) {
     if (c === 42 || c === 95 || c === 126) {
       let j = i;
       while (j < n && src.charCodeAt(j) === c) j++;
+      // A "*" or "_" delimiter inside a "[...](...)" region that is
+      // masked before emphasis matching is plain text, not a
+      // delimiter (the link itself need not form for the mask to
+      // apply).
+      if ((c === 42 || c === 95) && inMaskedRange(i)) {
+        buf += src.slice(i, j);
+        i = j;
+        continue;
+      }
       const len = j - i;
       const before = i === 0 ? 10 : src.charCodeAt(i - 1);
       const after = j >= n ? 10 : src.charCodeAt(j);
@@ -753,16 +895,16 @@ function parseInline(src, refs) {
       }
       buf += '\n'; i++; continue;
     }
-    if (c === 119 && src.slice(i, i + 4) === 'www.') {
+    if (c === 119 && !noAuto && src.slice(i, i + 4) === 'www.') {
       const w = tryWww(src, i);
       if (w) { flush(); nodes.push({ t: 'link', href: w.href, text: w.text, auto: true }); i = w.end; continue; }
     }
-    if (isAlpha(c)) {
+    if (isAlpha(c) && !noAuto) {
       const u = trySchemeUrl(src, i);
       if (u) { flush(); nodes.push({ t: 'link', href: u.href, text: u.text, auto: true }); i = u.end; continue; }
     }
-    if (c === 64) {
-      const e = tryEmail(src, i);
+    if (c === 64 && !noAuto) {
+      const e = tryEmail(src, i, inUnderscoreEm(i));
       if (e) {
         const localLen = i - e.start;
         if (localLen > 0 && buf.length >= localLen) buf = buf.slice(0, buf.length - localLen);
@@ -859,18 +1001,27 @@ function parseLinkAt(src, i, refs, isImage) {
       let k = j;
       while (k < src.length && src.charCodeAt(k) === 96) k++;
       const run = k - j;
+      // A run of 2+ backticks immediately before "]" is literal text
+      // (the `` ``+(?=\]) `` label alternative), so the label can
+      // still close.
+      if (run >= 2 && k < src.length && src.charCodeAt(k) === 93) { j = k; continue; }
+      // Otherwise a code span: the opening run, then text without
+      // backticks, then a closing run of ANY length (the opening and
+      // closing runs need not match). If no closing run exists, the
+      // label itself cannot be consumed at all.
       let m = k;
       let found = -1;
       while (m < src.length) {
         if (src.charCodeAt(m) === 96) {
           let q = m;
           while (q < src.length && src.charCodeAt(q) === 96) q++;
-          if (q - m === run) { found = q; break; }
-          m = q;
-        } else m++;
+          found = q;
+          break;
+        }
+        m++;
       }
-      if (found !== -1) { j = found; continue; }
-      j = k;
+      if (found === -1) return null;
+      j = found;
       continue;
     }
     // A nested image "![label](dest)" (or "![label][ref]" / "![label]")
@@ -1005,7 +1156,7 @@ function parseInlineDestAt(src, k) {
 }
 
 function finishLink(labelSrc, dest, title, end, refs, isImage) {
-  const children = parseInline(labelSrc, refs);
+  const children = parseInline(labelSrc, refs, true);
   // An image label may contain links (they are stripped to plain text
   // in the alt); a link label may not.
   if (!isImage && containsLink(children)) return null;
@@ -1430,6 +1581,11 @@ export function parse(markdown) {
       addChild({ t: 'code', fenced: false, baseIndent: base, lines: [curExpandedText()] });
       return true;
     }
+    // The container base: the column where container content starts.
+    // A fenced block's content is stripped up to the fence indent for
+    // backtick fences, but only up to this base for tilde fences
+    // (marked compensates the opening indent for ``` only).
+    const baseCol = cur.col;
     if (skipSpaces) curSkipSpaces(3);
     const c = curChar();
     if (c === -1) return false;
@@ -1465,7 +1621,7 @@ export function parse(markdown) {
         if (c === 96 && cur.line.slice(j).includes('`')) { /* not a fence */ }
         else {
           const info = cur.line.slice(j).trim();
-          const fence = { t: 'code', fenced: true, fenceChar: c, fenceLen: j - cur.off, fenceIndent: cur.col, info, lines: [] };
+          const fence = { t: 'code', fenced: true, fenceChar: c, fenceLen: j - cur.off, fenceIndent: cur.col, stripIndent: c === 96 ? cur.col : baseCol, info, lines: [] };
           addChild(fence); return true;
         }
       }
@@ -1484,7 +1640,10 @@ export function parse(markdown) {
         // ended at a blank line (no trailing newline).
         if (htmlBlockClosedOnFirstLine(h)) {
           open.pop();
-          if (cur.lineNo + 1 < lines.length && isBlankLine(lines[cur.lineNo + 1])) h.endedAtBlank = true;
+          // Only a truly empty next line suppresses the block's
+          // trailing newline; a whitespace-only line does not (the
+          // HTML token keeps its single trailing newline).
+          if (cur.lineNo + 1 < lines.length && lines[cur.lineNo + 1] === '') h.endedAtBlank = true;
         }
         return true;
       }
@@ -1630,7 +1789,7 @@ export function parse(markdown) {
 
   // Does the line start a block that interrupts a paragraph? An ordered
   // list only interrupts when it starts with 1.
-  function startsNewBlock(interrupt) {
+  function startsNewBlock(interrupt, matched) {
     const save = curSave();
     curSkipSpaces(3);
     const c = curChar();
@@ -1662,7 +1821,25 @@ export function parse(markdown) {
     } else if (isDigit(c) || c === 43) {
       const li = tryListMarker();
       if (li) {
-        if ((!li.ordered || li.start === 1) && (!interrupt || li.hasContent)) ok = true;
+        // Inside a list item, an ordered marker with any start number
+        // interrupts the paragraph (it starts a sub-list) -- but only
+        // when the marker sits at the item's own level. A marker
+        // inside a blockquote that lives in the item does not
+        // interrupt (there the paragraph rules apply, so only 1
+        // interrupts). `matched` is the deepest container the line
+        // matched; a quote the line matched into blocks the item.
+        let inItem = false;
+        let itemIdx = -1;
+        for (let k = open.length - 1; k >= 1; k--) {
+          if (open[k].t === 'item') { itemIdx = k; break; }
+        }
+        if (itemIdx !== -1) {
+          inItem = true;
+          for (let k = itemIdx + 1; k < open.length; k++) {
+            if (open[k].t === 'quote' && matched !== undefined && matched >= k) { inItem = false; break; }
+          }
+        }
+        if ((!li.ordered || li.start === 1 || inItem) && (!interrupt || li.hasContent)) ok = true;
       }
     }
     curRestore(save);
@@ -1722,7 +1899,7 @@ export function parse(markdown) {
     if (tip.t === 'code') {
       const save = curSave();
       cur.off = 0; cur.col = 0; cur.partial = 0;
-      if (tip.fenced) advanceFenceIndent(tip.fenceIndent);
+      if (tip.fenced) advanceFenceIndent(tip.stripIndent);
       else curAdvance((tip.baseIndent || 0) + 4);
       tip.lines.push(curExpandedText());
       curRestore(save);
@@ -1730,7 +1907,15 @@ export function parse(markdown) {
   }
   function processLine(line, lineNo) {
     cur.line = line; cur.off = 0; cur.col = 0; cur.partial = 0; cur.lineNo = lineNo;
-    if (isBlankLine(line)) { processBlankLine(); return; }
+    if (isBlankLine(line)) {
+      // A whitespace-only line that contains a tab is an empty table
+      // row (not a blank line) when the deepest open block is a
+      // table; whether it reaches the table is checked after
+      // container matching below.
+      if (!(open[open.length - 1].t === 'table' && line.includes('\t'))) {
+        processBlankLine(); return;
+      }
+    }
     const terminated = lineNo < lines.length - 1 || src.endsWith('\n');
     let matched = 0;
     for (let i = 1; i < open.length; i++) {
@@ -1760,11 +1945,49 @@ export function parse(markdown) {
     const restAfterContainers = cur.line.slice(cur.off);
     if (restAfterContainers === '' && matched > 0) {
       const tipC = open[open.length - 1];
-      if (tipC.t === 'para' || tipC.t === 'table') closeBlock();
-      // A marker-only line inside a blockquote is a blank inside the
-      // quote, not a blank separating list items, so it does not loosen
-      // the list.
+      if (tipC.t === 'code') {
+        // A marker-only line inside a code block is a blank content
+        // line: a fenced block keeps it (e.g. a blank first line in
+        // a blockquote fence), as does an indented block.
+        tipC.lines.push('');
+        return;
+      }
+      if (tipC.t === 'html' && tipC.htmlType <= 5) {
+        // A blank line inside an HTML block of types 1-5 is content.
+        tipC.lines.push('');
+        return;
+      }
+      if (tipC.t === 'html') {
+        // Types 6-7 end at a blank line.
+        tipC.endedAtBlank = true;
+        closeBlock();
+      } else if (tipC.t === 'para' || tipC.t === 'table') closeBlock();
+      // The line is a blank line inside the containers it matched, so
+      // it separates blocks at that level. Mark the list items that
+      // contain it (at or below the matched container) as
+      // blank-pending: the next block in such an item loosens its
+      // list, and a following item is separated by a blank line.
+      // Items above the matched container are not affected (the blank
+      // line is deeper than them, inside a nested blockquote).
+      for (let k = 1; k < open.length; k++) {
+        if (open[k].t === 'item' && k >= matched) open[k].blankPending = true;
+      }
       return;
+    }
+    // A tab-containing blank line is an empty table row when it
+    // matches the table's containers; otherwise it is a blank line
+    // outside the table.
+    if (isBlankLine(line) && line.includes('\t')) {
+      const tipB = open[open.length - 1];
+      if (tipB.t === 'table') {
+        let tableIdx = -1;
+        for (let k = 1; k < open.length; k++) if (open[k].t === 'table') tableIdx = k;
+        if (tableIdx !== -1 && matched === tableIdx - 1) {
+          tipB.rows.push([]);
+          return;
+        }
+      }
+      processBlankLine(); return;
     }
     // Lazy continuation: if the tip is a paragraph and this line does not
     // start a new block, the line continues the paragraph even though its
@@ -1782,7 +2005,7 @@ export function parse(markdown) {
       const lm = tryListMarker();
       if (lm && inList) {
         // fall through: close containers, start a new item
-      } else if (!startsNewBlock(true)) {
+      } else if (!startsNewBlock(true, matched)) {
         // A TRUE lazy line (some container did not match) indented by 4+
         // columns loses exactly 4 columns of indent. A normal top-level
         // paragraph continuation keeps its leading spaces.
@@ -1848,7 +2071,7 @@ export function parse(markdown) {
     if (top.t === 'para') {
       if (trySetext()) return;
       if (tryTableDelimiter()) return;
-      if (startsNewBlock(true)) {
+      if (startsNewBlock(true, matched)) {
         closeBlock();
         startBlocks();
         return;
@@ -1861,17 +2084,46 @@ export function parse(markdown) {
       curSkipSpaces(3);
       const c = curChar();
       let endsTable = false;
-      if (c === 35 || c === 96 || c === 126 || c === 62 || c === 60) endsTable = true;
-      else if (c === 45 || c === 42 || c === 95) {
+      // A table row is any line that is not blank and does not start
+      // (after at most 3 spaces) with a block that ends a table:
+      // ATX heading, fence, blockquote, HTML block (types 1-6),
+      // thematic break, list marker (bullet, or ordered starting
+      // with 1), or indented code. A row may start with a code span,
+      // an autolink, inline HTML, a number other than 1, etc.
+      if (c === 35) {
+        let j = cur.off;
+        while (j < cur.line.length && cur.line.charCodeAt(j) === 35) j++;
+        if (j - cur.off >= 1 && j - cur.off <= 6
+          && (j >= cur.line.length || cur.line.charCodeAt(j) === 32 || cur.line.charCodeAt(j) === 9)) endsTable = true;
+      } else if (c === 96 || c === 126) {
+        let j = cur.off;
+        while (j < cur.line.length && cur.line.charCodeAt(j) === c) j++;
+        if (j - cur.off >= 3) {
+          if (c === 96 && cur.line.slice(j).includes('`')) { /* not a fence */ }
+          else endsTable = true;
+        }
+      } else if (c === 62) endsTable = true;
+      else if (c === 60) {
+        const ht = htmlBlockType(cur.line.slice(cur.off));
+        if (ht >= 1 && ht <= 6) endsTable = true;
+      } else if (c === 45 || c === 42 || c === 95) {
         if (isThematicBreak(cur.line.slice(cur.off))) endsTable = true;
-      } else if (isDigit(c) || c === 43 || c === 45 || c === 42) {
-        if (tryListMarker()) endsTable = true;
+        else if (tryListMarker()) endsTable = true;
+      } else if (isDigit(c) || c === 43) {
+        const li = tryListMarker();
+        if (li && (!li.ordered || li.start === 1)) endsTable = true;
       }
       if (!endsTable) {
         const save2 = curSave();
         curAdvance(4);
-        if (cur.col >= 4) endsTable = true;
+        // Indented code (4+ columns) ends the table, but only when
+        // there is content after the indent.
+        if (cur.col >= 4 && curChar() !== -1) endsTable = true;
         curRestore(save2);
+      }
+      if (!endsTable && curExpandedText().trim() === '' && !cur.line.includes('\t')) {
+        // A spaces-only remainder is a blank line, not a row.
+        endsTable = true;
       }
       curRestore(save);
       if (endsTable) {
@@ -1898,11 +2150,29 @@ export function parse(markdown) {
         curRestore(save);
         const save2 = curSave();
         cur.off = 0; cur.col = 0; cur.partial = 0;
-        const sawQuote = advanceFenceIndent(top.fenceIndent);
-        // A tab at the content start is expanded to spaces to the next
-        // tab stop only inside a container (list item / blockquote);
-        // for a top-level indented fence it is preserved literally.
+        const sawQuote = advanceFenceIndent(top.stripIndent);
+        // A tab in the leading whitespace is expanded to spaces to
+        // the next tab stop only inside a container (list item /
+        // blockquote); for a top-level indented fence it is preserved
+        // literally. The expansion uses the absolute column, so a tab
+        // after spaces expands from its own column, not from the
+        // content start.
         const inContainer = open.some((b) => b.t === 'item' || b.t === 'quote' || b.t === 'list');
+        if (cur.partial === 0 && (sawQuote || inContainer)) {
+          const rest = cur.line.slice(cur.off);
+          let k = 0;
+          while (k < rest.length && (rest.charCodeAt(k) === 32 || rest.charCodeAt(k) === 9)) k++;
+          if (k > 0 && rest.slice(0, k).includes('\t')) {
+            let col = cur.col, out = '';
+            for (let j = 0; j < k; j++) {
+              if (rest.charCodeAt(j) === 32) { out += ' '; col++; }
+              else { const w = 4 - (col % 4); out += ' '.repeat(w); col += w; }
+            }
+            top.lines.push(out + rest.slice(k));
+            curRestore(save2);
+            return;
+          }
+        }
         if (cur.off < cur.line.length && cur.line.charCodeAt(cur.off) === 9 && cur.partial === 0
           && (sawQuote || inContainer)) {
           cur.partial = 4 - (cur.col % 4);
@@ -1938,8 +2208,10 @@ export function parse(markdown) {
       else if (t === 4) { if (lineText.includes('>')) done = true; }
       else if (t === 5) { if (lineText.includes(']]>')) done = true; }
       if (done) {
-        // A block followed by a blank line gets no trailing newline.
-        if (cur.lineNo + 1 < lines.length && isBlankLine(lines[cur.lineNo + 1])) top.endedAtBlank = true;
+        // A block followed by a blank line gets no trailing newline;
+        // only a truly empty next line counts (a whitespace-only line
+        // leaves the single trailing newline in place).
+        if (cur.lineNo + 1 < lines.length && lines[cur.lineNo + 1] === '') top.endedAtBlank = true;
         closeBlock();
       }
       return;
