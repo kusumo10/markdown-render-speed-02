@@ -1222,6 +1222,35 @@ function processEmphasis(nodes) {
           if (bothWays && (cand.len + closer.len) % 3 === 0
             && !(cand.len % 3 === 0 && closer.len % 3 === 0)) continue;
           use = (cand.len >= 2 && closer.len >= 2) ? 2 : 1;
+          // Poison check (marked emStrong odd-match absorption, "*"
+          // only: the "_" right-delim regex differs and does not show
+          // this absorption). A strong/em node between this opener
+          // and the closer, closed by a "both-ways" run whose length
+          // sums with the opener's to a multiple of 3, absorbs the
+          // opener — it cannot reach this closer. Only the first
+          // closer after that inner node is poisoned (an intervening
+          // em/strong/delim node breaks it, e.g. *a **b**c*d*e* pairs
+          // the outer * with the final *, not the * after c). Skip
+          // this opener, try an earlier one.
+          let poisoned = false;
+          if (ch === 42) for (let p = s + 1; p < ci && !poisoned; p++) {
+            const nd = nodes[p];
+            // Poison needs the inner node's OPENING run to be
+            // opener-only (preceded by space/punct, so marked's
+            // emStrongRDelim absorbs it into the opener count m). A
+            // both-ways opening run (*foo**bar**baz*) is skipped via
+            // the odd-match instead and does NOT block the outer pair.
+            if ((nd.t === 'strong' || nd.t === 'em') && nd.openOnly && nd.closeBoth
+              && (cand.len + nd.closeLen) % 3 === 0 && cand.len % 3 !== 0) {
+              let intervening = false;
+              for (let q = p + 1; q < ci; q++) {
+                const nq = nodes[q];
+                if (nq.t === 'delim' || nq.t === 'em' || nq.t === 'strong' || nq.t === 'del') { intervening = true; break; }
+              }
+              if (!intervening) poisoned = true;
+            }
+          }
+          if (poisoned) continue;
         }
         oi = s;
         break;
@@ -1230,7 +1259,7 @@ function processEmphasis(nodes) {
       const opener = nodes[oi];
       const inner = nodes.slice(oi + 1, ci);
       const tag = ch === 126 ? 'del' : (use === 2 ? 'strong' : 'em');
-      const newNode = { t: tag, children: inner };
+      const newNode = { t: tag, children: inner, closeLen: closer.len, closeBoth: closer.canOpen && closer.canClose, openOnly: opener.canOpen && !opener.canClose };
       const opLeft = opener.len - use;
       const clLeft = closer.len - use;
       const replacement = [];
