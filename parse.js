@@ -449,7 +449,9 @@ function schemeUrlEnd(src, i) {
   for (let k = i; k < end; k++) {
     const c = src.charCodeAt(k);
     if (c === 40) {
-      if (parenDepth === 0 && k > i) {
+      // An unbalanced "(" truncates the URL just before it, whether or
+      // not earlier ")"s drove the depth negative.
+      if (k > i) {
         let bal2 = 0;
         for (let m = k; m < end; m++) {
           if (src.charCodeAt(m) === 40) bal2++;
@@ -459,7 +461,7 @@ function schemeUrlEnd(src, i) {
       }
       parenDepth++;
     }
-    if (c === 41) parenDepth--;
+    if (c === 41 && parenDepth > 0) parenDepth--;
   }
   return end;
 }
@@ -759,10 +761,22 @@ function parseLinkAt(src, i, refs, isImage) {
     // A "<" that starts an unclosed/invalid HTML tag invalidates the
     // whole link (the label cannot contain an incomplete tag). A valid
     // tag is skipped as a whole so a "]" inside it does not close the
-    // label.
+    // label. An autolink (<scheme:...> or <email>) is NOT a tag and is
+    // allowed in a label.
     if (c === 60 && j + 1 < src.length) {
       const nc = src.charCodeAt(j + 1);
       if ((nc >= 65 && nc <= 90) || (nc >= 97 && nc <= 122) || nc === 33 || nc === 63 || nc === 47) {
+        // Skip an autolink: "<" + scheme (letter, then alnum/+/-/.,
+        // 2-32 chars) + ":" or an email-ish "<...@...>".
+        let ai = j + 1;
+        if (isAlpha(src.charCodeAt(ai))) {
+          let k2 = ai + 1;
+          while (k2 < src.length && (isAlnum(src.charCodeAt(k2)) || src.charCodeAt(k2) === 43 || src.charCodeAt(k2) === 45 || src.charCodeAt(k2) === 46)) k2++;
+          const isScheme = k2 - ai >= 2 && k2 - ai <= 32 && k2 < src.length && src.charCodeAt(k2) === 58;
+          const gt = src.indexOf('>', j + 1);
+          const isEmail = gt !== -1 && src.slice(j + 1, gt).includes('@');
+          if (isScheme || isEmail) { j = gt + 1; continue; }
+        }
         const tg = scanTagAt(src, j);
         if (!tg) return null;
         j = tg.end;
@@ -927,7 +941,9 @@ function finishLink(labelSrc, dest, title, end, refs, isImage) {
 }
 function containsLink(nodes) {
   for (const nd of nodes) {
-    if (nd.t === 'link') return true;
+    // Only a markdown-style link blocks an outer link; an autolink
+    // (<...> or www./email) inside a label is allowed.
+    if (nd.t === 'link' && !nd.auto) return true;
     if (nd.children && containsLink(nd.children)) return true;
   }
   return false;
@@ -1146,14 +1162,21 @@ export function parse(markdown) {
   // with less indentation than the fence is not eaten.
   const advanceFenceIndent = targetCol => {
     let sawQuote = false;
+    // ">" markers are only consumed when the fence is inside a
+    // blockquote; for a top-level fence a leading ">" is content.
+    const inQuote = open.some((b) => b.t === 'quote');
     while (cur.col < targetCol && cur.off < cur.line.length) {
       const ch = cur.line.charCodeAt(cur.off);
       if (ch === 32) { cur.off++; cur.col++; cur.partial = 0; }
       else if (ch === 9) {
         const w = 4 - (cur.col % 4);
         if (cur.col + w <= targetCol) { cur.off++; cur.col += w; cur.partial = 0; }
-        else { cur.partial = cur.col + w - targetCol; cur.col = targetCol; }
-      } else if (ch === 62) {
+        // A tab straddled by the fence indent is dropped entirely (its
+        // remainder is NOT kept as spaces). This differs from a tab
+        // partially consumed as the ">" optional space, whose remainder
+        // is kept.
+        else { cur.off++; cur.col = targetCol; cur.partial = 0; }
+      } else if (ch === 62 && inQuote) {
         sawQuote = true;
         cur.off++; cur.col++; cur.partial = 0;
         // The optional space after ">" is consumed as a unit (curAdvance
@@ -1737,10 +1760,12 @@ export function parse(markdown) {
         const save2 = curSave();
         cur.off = 0; cur.col = 0; cur.partial = 0;
         const sawQuote = advanceFenceIndent(top.fenceIndent);
-        // A tab at the content start inside a blockquote is content:
-        // expand it to spaces to the next tab stop. Outside a quote,
-        // a leading tab is preserved (or dropped as indentation).
-        if (sawQuote && cur.off < cur.line.length && cur.line.charCodeAt(cur.off) === 9 && cur.partial === 0) {
+        // A tab at the content start is expanded to spaces to the next
+        // tab stop only inside a container (list item / blockquote);
+        // for a top-level indented fence it is preserved literally.
+        const inContainer = open.some((b) => b.t === 'item' || b.t === 'quote' || b.t === 'list');
+        if (cur.off < cur.line.length && cur.line.charCodeAt(cur.off) === 9 && cur.partial === 0
+          && (sawQuote || inContainer)) {
           cur.partial = 4 - (cur.col % 4);
         }
         top.lines.push(curExpandedText());
